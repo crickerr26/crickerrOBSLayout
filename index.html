@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ICC Elite Pro OBS Overlay - Ultimate Replay Edition</title>
+    <title>ICC Elite Pro OBS Overlay - Stable Edition</title>
     
     <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
     <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
@@ -84,6 +84,7 @@
         let replayStartTime = 0;
         let replayType = ""; 
         let transitionStartTime = 0;
+        let stuckSafetyTimer = null; // Safety timer to prevent freezing
         
         // CAMERA VARIABLES
         const video = document.getElementById('video-source');
@@ -102,37 +103,25 @@
             if(params.has('id')) { document.getElementById('match-id').value = params.get('id'); }
             resizeCanvas(); 
             window.addEventListener('resize', resizeCanvas);
-            
-            // Populate Cameras
             getCameras();
         };
         
         async function getCameras() {
             const select = document.getElementById('cam-select');
             select.innerHTML = '<option value="">Searching...</option>';
-            
             try {
-                // Request permission first to see labels
                 await navigator.mediaDevices.getUserMedia({ video: true });
                 const devices = await navigator.mediaDevices.enumerateDevices();
                 const videoDevices = devices.filter(device => device.kind === 'videoinput');
-                
                 select.innerHTML = '';
-                if (videoDevices.length === 0) {
-                    select.innerHTML = '<option value="">No Camera Found</option>';
-                    return;
-                }
-                
+                if (videoDevices.length === 0) { select.innerHTML = '<option value="">No Camera Found</option>'; return; }
                 videoDevices.forEach((device, index) => {
                     const option = document.createElement('option');
                     option.value = device.deviceId;
                     option.text = device.label || `Camera ${index + 1}`;
                     select.appendChild(option);
                 });
-            } catch (err) {
-                console.error("Error fetching cameras:", err);
-                select.innerHTML = '<option value="">Camera Access Denied</option>';
-            }
+            } catch (err) { select.innerHTML = '<option value="">Camera Access Denied</option>'; }
         }
         
         function resizeCanvas() { const dpr = window.devicePixelRatio || 1; canvas.width = window.innerWidth * dpr; canvas.height = window.innerHeight * dpr; ctx.scale(dpr, dpr); canvas.style.width = window.innerWidth + 'px'; canvas.style.height = window.innerHeight + 'px'; }
@@ -142,12 +131,8 @@
             const id = document.getElementById('match-id').value; 
             const camId = document.getElementById('cam-select').value;
             if(!id) return alert("Please enter Match ID"); 
-            
-            // Start Camera using selected ID
             attemptCameraStart(camId);
-
             try { ['audio-four','audio-six','audio-wicket'].forEach(id => document.getElementById(id).load()); } catch(e){}
-            
             document.getElementById('setup-screen').style.display = 'none'; 
             document.getElementById('app-container').style.display = 'block'; 
             requestAnimationFrame(renderLoop); 
@@ -157,24 +142,12 @@
         // --- CAMERA & BUFFER LOGIC ---
         async function attemptCameraStart(deviceId) {
             let constraints = { video: { width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false };
-            
-            if (deviceId) {
-                constraints.video.deviceId = { exact: deviceId };
-            }
-
-            try {
-                await startCameraStream(constraints);
-            } catch(e) {
+            if (deviceId) { constraints.video.deviceId = { exact: deviceId }; }
+            try { await startCameraStream(constraints); } 
+            catch(e) {
                 console.log("High res failed, trying low res...");
-                try {
-                    constraints.video.width = { ideal: 1280 };
-                    constraints.video.height = { ideal: 720 };
-                    await startCameraStream(constraints);
-                } catch(e2) {
-                    console.error("Camera completely failed:", e2);
-                    document.getElementById('cam-status').innerText = "CAM: OFF (ERROR)";
-                    hasCameraAccess = false;
-                }
+                try { constraints.video.width = { ideal: 1280 }; constraints.video.height = { ideal: 720 }; await startCameraStream(constraints); } 
+                catch(e2) { document.getElementById('cam-status').innerText = "CAM: OFF (ERROR)"; hasCameraAccess = false; }
             }
         }
 
@@ -185,47 +158,46 @@
             video.play();
             hasCameraAccess = true;
             document.getElementById('cam-status').innerText = "CAM: ON";
-            
-            // Start Buffering
             startRollingReplayBuffer(stream);
         }
 
         function startRollingReplayBuffer(stream) {
             let options = { mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: 8000000 };
-            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-                options = { mimeType: 'video/webm;codecs=vp8', videoBitsPerSecond: 5000000 };
-            }
-            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-                 options = { videoBitsPerSecond: 2500000 }; 
-            }
-
+            if (!MediaRecorder.isTypeSupported(options.mimeType)) options = { mimeType: 'video/webm;codecs=vp8', videoBitsPerSecond: 5000000 };
             try {
                 replayRecorder = new MediaRecorder(stream, options);
                 replayChunks = [];
                 replayHeader = null; 
-
                 replayRecorder.ondataavailable = (e) => {
                     if (e.data && e.data.size > 0) {
                         if (!replayHeader) replayHeader = e.data;
                         else replayChunks.push(e.data);
-
-                        // KEEP ONLY LAST 12 SECONDS (Adjust based on memory)
-                        if(replayChunks.length > 30) replayChunks.shift();
+                        if(replayChunks.length > 30) replayChunks.shift(); // Keep buffer small
                     }
                 };
-                replayRecorder.start(400); // Slice every 400ms
-            } catch (e) {
-                console.warn("Replay buffer error:", e);
-                hasCameraAccess = false;
-            }
+                replayRecorder.start(400); 
+            } catch (e) { hasCameraAccess = false; }
         }
 
         // --- TRIGGER REPLAY ---
         function triggerReplay(type) {
+            // 1. SAFETY LOCK: If replay is already running, IGNORE new requests.
+            if (replayState !== "LIVE") {
+                console.warn("Replay request ignored - System Busy");
+                return;
+            }
+
             replayType = type;
 
-            if (!hasCameraAccess || !replayRecorder || !replayHeader) {
-                console.log("No camera access, playing graphics only.");
+            // 2. SAFETY TIMER: Force reset if stuck for 15 seconds
+            if(stuckSafetyTimer) clearTimeout(stuckSafetyTimer);
+            stuckSafetyTimer = setTimeout(() => {
+                console.warn("Replay stuck safety trigger!");
+                cleanupReplay();
+            }, 15000);
+
+            if (!hasCameraAccess || !replayRecorder || !replayHeader || replayRecorder.state !== 'recording') {
+                console.log("No camera/recorder ready, playing graphics only.");
                 replayState = "TRANSITION_IN";
                 transitionStartTime = Date.now();
                 return;
@@ -233,7 +205,7 @@
 
             // CAMERA OK: Process Video
             try {
-                replayRecorder.requestData(); // Flush
+                replayRecorder.requestData(); // Flush buffer
                 const fullBlob = [replayHeader, ...replayChunks];
                 const blob = new Blob(fullBlob, { type: replayHeader.type });
                 replayBlobUrl = URL.createObjectURL(blob);
@@ -263,6 +235,9 @@
         }
 
         function cleanupReplay() {
+            // Clear safety timer
+            if(stuckSafetyTimer) clearTimeout(stuckSafetyTimer);
+            
             if(replayVideo) {
                 replayVideo.pause();
                 replayVideo.remove();
@@ -273,8 +248,6 @@
                 replayBlobUrl = null;
             }
             
-            replayState = "LIVE";
-            
             // Reset Buffer
             if(hasCameraAccess && replayRecorder && replayRecorder.state !== 'inactive') {
                 replayRecorder.stop();
@@ -284,6 +257,9 @@
                     try { replayRecorder.start(400); } catch(e){}
                 }, 100);
             }
+            
+            // IMPORTANT: Set this LAST to avoid race conditions
+            replayState = "LIVE";
         }
 
         // --- DATABASE LISTENER ---
@@ -332,11 +308,9 @@
             
             // --- STATE MACHINE ---
             if (replayState === "LIVE") {
-                // Draw Live Video Background
                 if (hasCameraAccess && video.readyState >= 2) {
                      drawVideoObject(video, w, h);
                 }
-                
                 drawLiveGraphics(w, h);
             
             } else if (replayState === "TRANSITION_IN") {
@@ -350,26 +324,20 @@
                 }
 
             } else if (replayState === "PLAYING") {
-                // 1. Draw Recorded Replay Video
                 if (replayVideo && replayVideo.readyState >= 2) {
                     drawVideoObject(replayVideo, w, h);
                 } else if (hasCameraAccess && video.readyState >= 2) {
-                    drawVideoObject(video, w, h); // Fallback
+                    drawVideoObject(video, w, h);
                 }
                 
-                // 2. Draw Replay Badge
                 drawReplayOverlay(w, h); 
                 
                 const elapsed = Date.now() - replayStartTime;
-                
-                // Show replay for 6 seconds
                 if (elapsed > 6000) { 
                     replayState = "TRANSITION_OUT";
                     transitionStartTime = Date.now();
                 }
                 
-                if (elapsed > 9000) cleanupReplay();
-
             } else if (replayState === "TRANSITION_OUT") {
                 if (hasCameraAccess && video.readyState >= 2) drawVideoObject(video, w, h);
                 drawLiveGraphics(w, h); 
